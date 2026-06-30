@@ -121,19 +121,28 @@ def load_yaml_coordinates(yaml_path: str) -> dict | None:
 
 def load_camera_calibration(yaml_path: str):
     """
-    Load OpenCV camera calibration matrices (Camera Matrix, Dist Coeffs).
+    Load camera calibration matrices (Camera Matrix, Dist Coeffs) using PyYAML.
     """
     if not yaml_path or not os.path.exists(yaml_path):
         return None, None
-    fs = cv2.FileStorage(yaml_path, cv2.FILE_STORAGE_READ)
-    if not fs.isOpened():
-        print(f"[WARN] Failed to open calibration YAML: {yaml_path}", file=sys.stderr)
+    try:
+        with open(yaml_path, "r") as f:
+            data = yaml.safe_load(f)
+        cam_data = data.get("camera_matrix", {})
+        dist_data = data.get("distortion_coefficients", {})
+        
+        camera_matrix = None
+        dist_coeffs = None
+        
+        if "data" in cam_data:
+            camera_matrix = np.array(cam_data["data"], dtype=np.float32).reshape((3, 3))
+        if "data" in dist_data:
+            dist_coeffs = np.array(dist_data["data"], dtype=np.float32)
+            
+        return camera_matrix, dist_coeffs
+    except Exception as e:
+        print(f"[WARN] Failed to load calibration via PyYAML: {e}", file=sys.stderr)
         return None, None
-    
-    camera_matrix = fs.getNode("camera_matrix").mat()
-    dist_coeffs = fs.getNode("distortion_coefficients").mat() 
-    fs.release()
-    return camera_matrix, dist_coeffs
 
 # ---------------------------------------------------------------------------
 # Reference-image loading
@@ -237,9 +246,19 @@ def compare_and_localize(img_bgr: np.ndarray, ref: dict, threshold: float) -> di
 # Main Processing Loop
 # ---------------------------------------------------------------------------
 def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib_yaml: str = None):
-    # Camera Calib setup (Task 4)
+    # Default camera parameters if no calibration file is found
+    fx = 1651.36327
+    fy = 1649.05851
+    cx = 989.33579
+    cy = 533.58065
+    
     if calib_yaml:
         cam_mat, dist_coeff = load_camera_calibration(calib_yaml)
+        if cam_mat is not None:
+            fx = float(cam_mat[0, 0])
+            fy = float(cam_mat[1, 1])
+            cx = float(cam_mat[0, 2])
+            cy = float(cam_mat[1, 2])
 
     refs = load_reference_images(ref_images_dir)
     if not refs:
@@ -268,41 +287,63 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
             img_idx = get_file_num(name)
             query_images.append((img_idx, img_path, yaml_path))
 
-    matched_coords = []
+    # Group detections by unique reference image name
+    feature_coords = {ref["name"]: [] for ref in refs}
+
     for count, (img_idx, img_path, yaml_path) in enumerate(query_images, 1):
         img_bgr = cv2.imread(img_path)
         if img_bgr is None: continue
 
         coords = load_yaml_coordinates(yaml_path)
-        matched_for_query = False
         for ref in refs:
             match_data = compare_and_localize(img_bgr, ref, threshold)
             
             if match_data:
                 score = match_data["score"]
-                cx, cy = match_data["centroid"]
+                u, v = match_data["centroid"]
                 x1, y1, x2, y2 = match_data["bbox"]
                 
                 # Format: only image_name and confidence_percent to stdout
                 print(f"{os.path.basename(img_path)} {score * 100:.2f}%")
 
-                if coords and not matched_for_query:
-                    matched_coords.append(coords)
-                    matched_for_query = True
+                if coords:
+                    z = coords.get("z", 1.8)
+                    dx = ((u - cx) * z) / fx
+                    dy = -((v - cy) * z) / fy  # Negative Y offset projection
+                    
+                    global_x = coords.get("x", 0.0) + dx
+                    global_y = coords.get("y", 0.0) + dy
+                    global_z = 0.0  # Ground plane z-coordinate
+                    
+                    feature_coords[ref["name"]].append((global_x, global_y, global_z))
 
                 if SHOW_DEBUG:
                     debug_frame = img_bgr.copy()
                     cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(debug_frame, (cx, cy), 5, (0, 0, 255), -1)
+                    cv2.circle(debug_frame, (int(u), int(v)), 5, (0, 0, 255), -1)
                     text = f"{ref['name']} - {score * 100:.1f}%"
                     cv2.putText(debug_frame, text, (x1, max(y1 - 10, 20)), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     cv2.namedWindow("xyz", cv2.WINDOW_NORMAL)
                     cv2.resizeWindow("xyz", 800, 600)
                     cv2.imshow("xyz", debug_frame)
-                    cv2.waitKey(0)
+                    cv2.waitKey(1)
+
+    # Average coordinates within each unique feature type
+    matched_coords = []
+    for ref_name, points in sorted(feature_coords.items()):
+        if len(points) > 0:
+            pts = np.array(points)
+            mean_pt = np.mean(pts, axis=0)
+            matched_coords.append({
+                "ref_name": ref_name,
+                "x": float(mean_pt[0]),
+                "y": float(mean_pt[1]),
+                "z": float(mean_pt[2]),
+            })
 
     return matched_coords
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -312,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("images_dir", help="Path to the folder containing query images.")
     parser.add_argument("ref_images_dir", help="Path to the folder containing reference images.")
     parser.add_argument("--threshold", type=float, default=MATCH_THRESHOLD, help="Heatmap threshold.")
-    parser.add_argument("--calib", type=str, default=None, help="Path to camera calibration YAML.")
+    parser.add_argument("--calib", type=str, default="zebronics_HD_new.yaml", help="Path to camera calibration YAML.")
     
     args = parser.parse_args()
 
@@ -320,6 +361,7 @@ if __name__ == "__main__":
         images_dir     = args.images_dir,
         ref_images_dir = args.ref_images_dir,
         threshold      = args.threshold,
+        calib_yaml     = args.calib,
     )
 
     yaml_str = yaml.safe_dump(coords_list, default_flow_style=False)
