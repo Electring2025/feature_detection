@@ -1,0 +1,4 @@
+images_dir/
+ref_images/
+*.log
+__pycache__/
