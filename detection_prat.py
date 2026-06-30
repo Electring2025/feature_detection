@@ -17,10 +17,12 @@ MODEL_NAME         = "facebook/dinov2-base"
 # Mapping of reference filenames to descriptive nouns (Feature IDs)
 FEATURE_NAMES = {
     "red rock.jpeg": "red_rock",
-    "silver_soil.jpeg": "silver_soil",
-    "red_soil.jpeg": "red_soil",
+    "silver soil.jpeg": "silver_soil",
+    "red soil.jpeg": "red_soil",
     # Add other reference filenames and their desired nouns here
 }
+
+PHYSICAL_REF_HEIGHT = 0.15      # Physical size of the target features (e.g. 0.15m = 15cm)
 
 # Visualization toggle
 SHOW_DEBUG         = True        # Set to True to visualize matches
@@ -192,67 +194,63 @@ def load_reference_images(ref_dir: str) -> list:
 # ---------------------------------------------------------------------------
 # Comparison & Localization
 # ---------------------------------------------------------------------------
-def compare_and_localize(img_bgr: np.ndarray, ref: dict, threshold: float) -> dict | None:
+def compare_and_localize(img_bgr: np.ndarray, ref: dict, threshold: float, z: float, fy: float) -> dict | None:
     orig_h, orig_w = img_bgr.shape[:2]
     
-    best_score = -1.0
-    best_bbox = None
-    best_centroid = None
+    # Calculate scale so that reference template features in query frame match the template scale (128px)
+    scale = (128.0 * z) / (fy * PHYSICAL_REF_HEIGHT)
     
-    # Search across multiple query resolutions to handle scale variations
-    for target_h in [336, 448, 560]:
-        target_w = int(round((target_h * (orig_w / orig_h)) / 14)) * 14
+    # Determine query dimensions as multiple of 14
+    target_h = int(round((orig_h * scale) / 14)) * 14
+    target_w = int(round((orig_w * scale) / 14)) * 14
+    
+    # Constrain to valid ranges
+    target_h = max(140, min(560, target_h))
+    target_w = int(round((target_h * (orig_w / orig_h)) / 14)) * 14
+    
+    query_tensor = preprocess_image_tensor(img_bgr, target_w, target_h, device)
+    with torch.no_grad():
+        outputs = model(pixel_values=query_tensor)
         
-        query_tensor = preprocess_image_tensor(img_bgr, target_w, target_h, device)
-        with torch.no_grad():
-            outputs = model(pixel_values=query_tensor)
-            
-        patch_tokens = outputs.last_hidden_state[:, 1:, :] # [1, H_patches * W_patches, 768]
-        H_patches = target_h // 14
-        W_patches = target_w // 14
-        
-        patch_grid = patch_tokens.view(1, H_patches, W_patches, 768).permute(0, 3, 1, 2)
-        query_features = torch.nn.functional.normalize(patch_grid, p=2, dim=1)
-        
-        sim_map = compute_dense_similarity(query_features, ref["emb"], ref["attn"])
-        
-        max_val, max_idx = torch.max(sim_map.view(-1), dim=0)
-        max_val = max_val.item()
-        
-        if max_val > best_score:
-            best_score = max_val
-            
-            H_map, W_map = sim_map.shape
-            py = (max_idx // W_map).item()
-            px = (max_idx % W_map).item()
-            
-            # Map patch coordinates to resized image
-            x1, y1 = px * 14, py * 14
-            x2, y2 = (px + 10) * 14, (py + 10) * 14
-            
-            # Scale to original image
-            scale_x = orig_w / target_w
-            scale_y = orig_h / target_h
-            
-            orig_x1 = max(0, min(orig_w - 1, int(round(x1 * scale_x))))
-            orig_y1 = max(0, min(orig_h - 1, int(round(y1 * scale_y))))
-            orig_x2 = max(0, min(orig_w - 1, int(round(x2 * scale_x))))
-            orig_y2 = max(0, min(orig_h - 1, int(round(y2 * scale_y))))
-            
-            best_bbox = (orig_x1, orig_y1, orig_x2, orig_y2)
-            best_centroid = ((orig_x1 + orig_x2) // 2, (orig_y1 + orig_y2) // 2)
-            
-    if best_score < threshold:
+    patch_tokens = outputs.last_hidden_state[:, 1:, :] # [1, H_patches * W_patches, 768]
+    H_patches = target_h // 14
+    W_patches = target_w // 14
+    
+    patch_grid = patch_tokens.view(1, H_patches, W_patches, 768).permute(0, 3, 1, 2)
+    query_features = torch.nn.functional.normalize(patch_grid, p=2, dim=1)
+    
+    sim_map = compute_dense_similarity(query_features, ref["emb"], ref["attn"])
+    
+    max_val, max_idx = torch.max(sim_map.view(-1), dim=0)
+    score = max_val.item()
+    
+    if score < threshold:
         return None
         
-    x1, y1, x2, y2 = best_bbox
-    if x2 <= x1 or y2 <= y1:
+    H_map, W_map = sim_map.shape
+    py = (max_idx // W_map).item()
+    px = (max_idx % W_map).item()
+    
+    # Map patch coordinates to resized image
+    x1, y1 = px * 14, py * 14
+    x2, y2 = (px + 10) * 14, (py + 10) * 14
+    
+    # Scale to original image
+    scale_x = orig_w / target_w
+    scale_y = orig_h / target_h
+    
+    orig_x1 = max(0, min(orig_w - 1, int(round(x1 * scale_x))))
+    orig_y1 = max(0, min(orig_h - 1, int(round(y1 * scale_y))))
+    orig_x2 = max(0, min(orig_w - 1, int(round(x2 * scale_x))))
+    orig_y2 = max(0, min(orig_h - 1, int(round(y2 * scale_y))))
+    
+    if orig_x2 <= orig_x1 or orig_y2 <= orig_y1:
         return None
         
     return {
-        "centroid": best_centroid,
-        "bbox": best_bbox,
-        "score": best_score
+        "centroid": ((orig_x1 + orig_x2) // 2, (orig_y1 + orig_y2) // 2),
+        "bbox": (orig_x1, orig_y1, orig_x2, orig_y2),
+        "score": score
     }
 
 # ---------------------------------------------------------------------------
@@ -342,8 +340,9 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
         any_match = False
         # Collect matches for all reference templates in current frame
         frame_candidates = []
+        z = coords.get("z", 1.8) if coords else 1.8
         for ref in refs:
-            match_data = compare_and_localize(img_bgr, ref, threshold)
+            match_data = compare_and_localize(img_bgr, ref, threshold, z, fy)
             if match_data:
                 frame_candidates.append((ref, match_data))
         

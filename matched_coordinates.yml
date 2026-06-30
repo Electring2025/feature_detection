@@ -1,18 +1,18 @@
 # Feature ID: red_rock
-# Position obtained from image set: image_260.jpg to image_269.jpg
+# Position obtained from image set: image_250.jpg to image_259.jpg
 - ref_name: "red rock.jpeg"
-  x: -5.919217005806201
-  y: -0.9565403226539355
+  x: -5.95767025112047
+  y: -0.8768289415481874
   z: 0.0
-# Feature ID: red_soil
+# Feature ID: red_soil.jpeg
 # Position obtained from image set: image_280.jpg to image_289.jpg
-- ref_name: "red soil.jpeg"
-  x: -8.58836947329782
-  y: -2.773945905689478
+- ref_name: "red_soil.jpeg"
+  x: -8.632105962774888
+  y: -2.705816277905571
   z: 0.0
 # Feature ID: silver_soil.jpeg
 # Position obtained from image set: image_330.jpg to image_339.jpg
 - ref_name: "silver_soil.jpeg"
-  x: -7.5796124264306215
-  y: 2.0218293032106858
+  x: -7.5703567028206535
+  y: 2.039704575853556
   z: 0.0
