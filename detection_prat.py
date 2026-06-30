@@ -191,67 +191,6 @@ def load_reference_images(ref_dir: str) -> list:
         })
     return refs
 
-# ---------------------------------------------------------------------------
-# Comparison & Localization
-# ---------------------------------------------------------------------------
-def compare_and_localize(img_bgr: np.ndarray, ref: dict, threshold: float, z: float, fy: float) -> dict | None:
-    orig_h, orig_w = img_bgr.shape[:2]
-    
-    # Calculate scale so that reference template features in query frame match the template scale (128px)
-    scale = (128.0 * z) / (fy * PHYSICAL_REF_HEIGHT)
-    
-    # Determine query dimensions as multiple of 14
-    target_h = int(round((orig_h * scale) / 14)) * 14
-    target_w = int(round((orig_w * scale) / 14)) * 14
-    
-    # Constrain to valid ranges
-    target_h = max(140, min(560, target_h))
-    target_w = int(round((target_h * (orig_w / orig_h)) / 14)) * 14
-    
-    query_tensor = preprocess_image_tensor(img_bgr, target_w, target_h, device)
-    with torch.no_grad():
-        outputs = model(pixel_values=query_tensor)
-        
-    patch_tokens = outputs.last_hidden_state[:, 1:, :] # [1, H_patches * W_patches, 768]
-    H_patches = target_h // 14
-    W_patches = target_w // 14
-    
-    patch_grid = patch_tokens.view(1, H_patches, W_patches, 768).permute(0, 3, 1, 2)
-    query_features = torch.nn.functional.normalize(patch_grid, p=2, dim=1)
-    
-    sim_map = compute_dense_similarity(query_features, ref["emb"], ref["attn"])
-    
-    max_val, max_idx = torch.max(sim_map.view(-1), dim=0)
-    score = max_val.item()
-    
-    if score < threshold:
-        return None
-        
-    H_map, W_map = sim_map.shape
-    py = (max_idx // W_map).item()
-    px = (max_idx % W_map).item()
-    
-    # Map patch coordinates to resized image
-    x1, y1 = px * 14, py * 14
-    x2, y2 = (px + 10) * 14, (py + 10) * 14
-    
-    # Scale to original image
-    scale_x = orig_w / target_w
-    scale_y = orig_h / target_h
-    
-    orig_x1 = max(0, min(orig_w - 1, int(round(x1 * scale_x))))
-    orig_y1 = max(0, min(orig_h - 1, int(round(y1 * scale_y))))
-    orig_x2 = max(0, min(orig_w - 1, int(round(x2 * scale_x))))
-    orig_y2 = max(0, min(orig_h - 1, int(round(y2 * scale_y))))
-    
-    if orig_x2 <= orig_x1 or orig_y2 <= orig_y1:
-        return None
-        
-    return {
-        "centroid": ((orig_x1 + orig_x2) // 2, (orig_y1 + orig_y2) // 2),
-        "bbox": (orig_x1, orig_y1, orig_x2, orig_y2),
-        "score": score
-    }
 
 # ---------------------------------------------------------------------------
 # Main Processing Loop
@@ -336,15 +275,59 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
         if img_bgr is None: continue
 
         coords = load_yaml_coordinates(yaml_path)
+        z = coords.get("z", 1.8) if coords else 1.8
+
+        orig_h, orig_w = img_bgr.shape[:2]
         
+        # Calculate scale so that reference template features in query frame match the template scale (128px)
+        scale = (128.0 * z) / (fy * PHYSICAL_REF_HEIGHT)
+        target_h = max(140, min(560, int(round((orig_h * scale) / 14)) * 14))
+        target_w = int(round((target_h * (orig_w / orig_h)) / 14)) * 14
+        
+        # Run model forward pass exactly once for the query image
+        query_tensor = preprocess_image_tensor(img_bgr, target_w, target_h, device)
+        with torch.no_grad():
+            outputs = model(pixel_values=query_tensor)
+            
+        patch_tokens = outputs.last_hidden_state[:, 1:, :] # [1, H_patches * W_patches, 768]
+        H_patches = target_h // 14
+        W_patches = target_w // 14
+        
+        patch_grid = patch_tokens.view(1, H_patches, W_patches, 768).permute(0, 3, 1, 2)
+        query_features = torch.nn.functional.normalize(patch_grid, p=2, dim=1)
+
         any_match = False
         # Collect matches for all reference templates in current frame
         frame_candidates = []
-        z = coords.get("z", 1.8) if coords else 1.8
         for ref in refs:
-            match_data = compare_and_localize(img_bgr, ref, threshold, z, fy)
-            if match_data:
-                frame_candidates.append((ref, match_data))
+            sim_map = compute_dense_similarity(query_features, ref["emb"], ref["attn"])
+            max_val, max_idx = torch.max(sim_map.view(-1), dim=0)
+            score = max_val.item()
+            
+            if score >= threshold:
+                H_map, W_map = sim_map.shape
+                py = (max_idx // W_map).item()
+                px = (max_idx % W_map).item()
+                
+                # Map patch coordinates to resized image
+                x1, y1 = px * 14, py * 14
+                x2, y2 = (px + 10) * 14, (py + 10) * 14
+                
+                # Scale to original dimensions
+                scale_x = orig_w / target_w
+                scale_y = orig_h / target_h
+                
+                orig_x1 = max(0, min(orig_w - 1, int(round(x1 * scale_x))))
+                orig_y1 = max(0, min(orig_h - 1, int(round(y1 * scale_y))))
+                orig_x2 = max(0, min(orig_w - 1, int(round(x2 * scale_x))))
+                orig_y2 = max(0, min(orig_h - 1, int(round(y2 * scale_y))))
+                
+                if orig_x2 > orig_x1 and orig_y2 > orig_y1:
+                    frame_candidates.append((ref, {
+                        "centroid": ((orig_x1 + orig_x2) // 2, (orig_y1 + orig_y2) // 2),
+                        "bbox": (orig_x1, orig_y1, orig_x2, orig_y2),
+                        "score": score
+                    }))
         
         # Select the single best template match (highest confidence score)
         if frame_candidates:
@@ -390,13 +373,13 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
                 cv2.circle(debug_frame, matched_centroid, 5, (0, 0, 255), -1)
                 text = f"{matched_noun} - {matched_score * 100:.1f}%"
                 cv2.putText(debug_frame, text, (bx1, max(by1 - 10, 20)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 4)
             else:
                 cv2.putText(debug_frame, "No Match Detected", (30, 40), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
                             
             cv2.namedWindow("xyz", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("xyz", 800, 600)
+            cv2.resizeWindow("xyz", 600, 600)
             cv2.imshow("xyz", debug_frame)
             cv2.waitKey(1)
 
