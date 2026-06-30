@@ -1,6 +1,12 @@
-- x: 0.20640819743505287
-  y: 2.2031751386020466
+# Feature ID: red_rock
+# Position obtained from image set: image_160.jpg to image_169.jpg
+- ref_name: "red rock.jpeg"
+  x: -5.915007386429434
+  y: -0.891749370472566
   z: 0.0
-- x: 0.18989753155388678
-  y: 2.431580312692472
+# Feature ID: red_soil
+# Position obtained from image set: image_280.jpg to image_289.jpg
+- ref_name: "red soil.jpeg"
+  x: -8.593836534482453
+  y: -2.773669405576719
   z: 0.0

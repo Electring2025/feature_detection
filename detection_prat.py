@@ -11,11 +11,19 @@ from transformers import AutoImageProcessor, AutoModel
 # =============================================================================
 #  HYPERPARAMETERS — edit everything here
 # =============================================================================
-MATCH_THRESHOLD    = 0.32       # Cosine-similarity threshold for patch matching
+MATCH_THRESHOLD    = 0.37       # Cosine-similarity threshold for patch matching
 MODEL_NAME         = "facebook/dinov2-base"
 
+# Mapping of reference filenames to descriptive nouns (Feature IDs)
+FEATURE_NAMES = {
+    "red rock.jpeg": "red_rock",
+    "silver soil.jpeg": "silver_soil",
+    "red soil.jpeg": "red_soil",
+    # Add other reference filenames and their desired nouns here
+}
+
 # Visualization toggle
-SHOW_DEBUG         = True        # Set to True to visualize matches (press any key to continue)
+SHOW_DEBUG         = False        # Set to True to visualize matches
 # =============================================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,8 +31,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-model     = AutoModel.from_pretrained(MODEL_NAME, attn_implementation="eager").to(device).eval()
+processor = AutoImageProcessor.from_pretrained(MODEL_NAME, local_files_only=True)
+model     = AutoModel.from_pretrained(MODEL_NAME, attn_implementation="eager", local_files_only=True).to(device).eval()
 
 # ---------------------------------------------------------------------------
 # Embedding helpers
@@ -59,10 +67,13 @@ def get_template_embedding(img_rgb_128: np.ndarray):
     
     normalized_patches = torch.nn.functional.normalize(roi_patches, p=2, dim=-1)
     
-    # Extract CLS attention map from last layer
-    last_layer_att = outputs.attentions[-1]
-    cls_to_patches = last_layer_att[0, :, 0, 1:]
-    mean_attention = cls_to_patches.mean(dim=0)
+    # Extract and average CLS attention maps from the last 3 layers
+    last_layers_att = [outputs.attentions[i] for i in [-1, -2, -3]]
+    all_cls_to_patches = []
+    for att in last_layers_att:
+        cls_to_patches = att[0, :, 0, 1:]
+        all_cls_to_patches.append(cls_to_patches.mean(dim=0))
+    mean_attention = torch.stack(all_cls_to_patches).mean(dim=0)
     attn_grid = mean_attention.view(16, 16)
     roi_attn = attn_grid[3:13, 3:13]
     roi_attn = (roi_attn - roi_attn.min()) / (roi_attn.max() - roi_attn.min() + 1e-8)
@@ -169,8 +180,10 @@ def load_reference_images(ref_dir: str) -> list:
         img_128_rgb = cv2.cvtColor(img_128_bgr, cv2.COLOR_BGR2RGB)
         
         normalized_patches, roi_attn = get_template_embedding(img_128_rgb)
+        ref_noun = FEATURE_NAMES.get(name, name)
         refs.append({
             "name": name,
+            "noun": ref_noun,
             "emb": normalized_patches,
             "attn": roi_attn,
         })
@@ -287,61 +300,136 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
             img_idx = get_file_num(name)
             query_images.append((img_idx, img_path, yaml_path))
 
-    # Group detections by unique reference image name
-    feature_coords = {ref["name"]: [] for ref in refs}
+    # Group raw detections by stop group_id (10 images per stop)
+    group_detections = {}
 
     for count, (img_idx, img_path, yaml_path) in enumerate(query_images, 1):
+        if count % 10 == 0 or count == len(query_images):
+            print(f"-> Active progress: processed {count}/{len(query_images)} frames...", flush=True)
+
         img_bgr = cv2.imread(img_path)
         if img_bgr is None: continue
 
         coords = load_yaml_coordinates(yaml_path)
+        
+        any_match = False
+        # Collect matches for all reference templates in current frame
+        frame_candidates = []
         for ref in refs:
             match_data = compare_and_localize(img_bgr, ref, threshold)
-            
             if match_data:
-                score = match_data["score"]
-                u, v = match_data["centroid"]
-                x1, y1, x2, y2 = match_data["bbox"]
+                frame_candidates.append((ref, match_data))
+        
+        # Select the single best template match (highest confidence score)
+        if frame_candidates:
+            best_ref, best_match = max(frame_candidates, key=lambda x: x[1]["score"])
+            score = best_match["score"]
+            u, v = best_match["centroid"]
+            x1, y1, x2, y2 = best_match["bbox"]
+
+            # Format: only image_name and confidence_percent to stdout
+            print(f"{os.path.basename(img_path)} {score * 100:.2f}%")
+
+            any_match = True
+            matched_bbox = (x1, y1, x2, y2)
+            matched_centroid = (int(u), int(v))
+            matched_noun = best_ref["noun"]
+            matched_score = score
+
+            if coords:
+                z = coords.get("z", 1.8)
+                dx = ((u - cx) * z) / fx
+                dy = -((v - cy) * z) / fy  # Negative Y offset projection
                 
-                # Format: only image_name and confidence_percent to stdout
-                print(f"{os.path.basename(img_path)} {score * 100:.2f}%")
+                global_x = coords.get("x", 0.0) + dx
+                global_y = coords.get("y", 0.0) + dy
+                global_z = 0.0  # Ground plane z-coordinate
+                
+                group_id = (img_idx // 10) * 10
+                if group_id not in group_detections:
+                    group_detections[group_id] = []
+                group_detections[group_id].append({
+                    "ref_name": best_ref["name"],
+                    "x": global_x,
+                    "y": global_y,
+                    "z": global_z,
+                    "score": score
+                })
 
-                if coords:
-                    z = coords.get("z", 1.8)
-                    dx = ((u - cx) * z) / fx
-                    dy = -((v - cy) * z) / fy  # Negative Y offset projection
-                    
-                    global_x = coords.get("x", 0.0) + dx
-                    global_y = coords.get("y", 0.0) + dy
-                    global_z = 0.0  # Ground plane z-coordinate
-                    
-                    feature_coords[ref["name"]].append((global_x, global_y, global_z))
+        if SHOW_DEBUG:
+            debug_frame = img_bgr.copy()
+            if any_match and matched_bbox:
+                bx1, by1, bx2, by2 = matched_bbox
+                cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                cv2.circle(debug_frame, matched_centroid, 5, (0, 0, 255), -1)
+                text = f"{matched_noun} - {matched_score * 100:.1f}%"
+                cv2.putText(debug_frame, text, (bx1, max(by1 - 10, 20)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(debug_frame, "No Match Detected", (30, 40), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                            
+            cv2.namedWindow("xyz", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("xyz", 800, 600)
+            cv2.imshow("xyz", debug_frame)
+            cv2.waitKey(1)
 
-                if SHOW_DEBUG:
-                    debug_frame = img_bgr.copy()
-                    cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(debug_frame, (int(u), int(v)), 5, (0, 0, 255), -1)
-                    text = f"{ref['name']} - {score * 100:.1f}%"
-                    cv2.putText(debug_frame, text, (x1, max(y1 - 10, 20)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.namedWindow("xyz", cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow("xyz", 800, 600)
-                    cv2.imshow("xyz", debug_frame)
-                    cv2.waitKey(1)
+    # Apply stop-wise majority voting & confidence filtering
+    validated_by_group = {} 
+    for group_id, detections in group_detections.items():
+        counts = {}
+        max_scores = {}
+        for d in detections:
+            r = d["ref_name"]
+            counts[r] = counts.get(r, 0) + 1
+            max_scores[r] = max(max_scores.get(r, 0.0), d["score"])
+        
+        if counts:
+            # Winner has highest occurrence count, resolved by highest confidence score
+            winning_ref = max(counts.keys(), key=lambda r: (counts[r], max_scores[r]))
+            validated_by_group[group_id] = [d for d in detections if d["ref_name"] == winning_ref]
 
-    # Average coordinates within each unique feature type
+    # Find the single 10-frame stop group with the most detections for each reference feature
+    ref_group_counts = {}
+    ref_group_max_score = {}
+    ref_group_detections = {}
+
+    for group_id, detections in validated_by_group.items():
+        for d in detections:
+            r = d["ref_name"]
+            if r not in ref_group_counts:
+                ref_group_counts[r] = {}
+                ref_group_max_score[r] = {}
+                ref_group_detections[r] = {}
+            
+            ref_group_detections[r][group_id] = ref_group_detections[r].get(group_id, [])
+            ref_group_detections[r][group_id].append(d)
+            ref_group_counts[r][group_id] = len(ref_group_detections[r][group_id])
+            ref_group_max_score[r][group_id] = max(ref_group_max_score[r].get(group_id, 0.0), d["score"])
+
+    # Resolve coordinates ONLY from the single best stop group for each unique feature
     matched_coords = []
-    for ref_name, points in sorted(feature_coords.items()):
-        if len(points) > 0:
-            pts = np.array(points)
+    for ref in refs:
+        ref_name = ref["name"]
+        if ref_name in ref_group_counts and ref_group_counts[ref_name]:
+            # Select the winning 10-frame group: most occurrences, resolved by max confidence score
+            best_group_id = max(
+                ref_group_counts[ref_name].keys(),
+                key=lambda gid: (ref_group_counts[ref_name][gid], ref_group_max_score[ref_name][gid])
+            )
+            best_pts = ref_group_detections[ref_name][best_group_id]
+            pts = np.array([[d["x"], d["y"], d["z"]] for d in best_pts])
             mean_pt = np.mean(pts, axis=0)
+            
             matched_coords.append({
                 "ref_name": ref_name,
                 "x": float(mean_pt[0]),
                 "y": float(mean_pt[1]),
                 "z": float(mean_pt[2]),
+                "source_group": f"image_{best_group_id}.jpg to image_{best_group_id+9}.jpg"
             })
 
+    print(f"Processing complete. Evaluated {len(query_images)} images.", flush=True)
     return matched_coords
 
 
@@ -364,6 +452,24 @@ if __name__ == "__main__":
         calib_yaml     = args.calib,
     )
 
-    yaml_str = yaml.safe_dump(coords_list, default_flow_style=False)
+    # Format the coordinates into a YAML string with Feature ID comments
+    yaml_lines = []
+    for item in coords_list:
+        ref_noun = FEATURE_NAMES.get(item["ref_name"], item["ref_name"])
+        yaml_lines.append(f"# Feature ID: {ref_noun}")
+        yaml_lines.append(f"# Position obtained from image set: {item['source_group']}")
+        yaml_lines.append(f"- ref_name: \"{item['ref_name']}\"")
+        yaml_lines.append(f"  x: {item['x']}")
+        yaml_lines.append(f"  y: {item['y']}")
+        yaml_lines.append(f"  z: {item['z']}")
+    
+    yaml_str = "\n".join(yaml_lines) + "\n" if yaml_lines else "[]\n"
     with open("matched_coordinates.yml", "w") as f:
         f.write(yaml_str)
+
+    # Clean up resources to prevent VS Code terminal window/display server crashes
+    cv2.destroyAllWindows()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[INFO] Processing complete. Matched coordinates saved to 'matched_coordinates.yml'.")
+
