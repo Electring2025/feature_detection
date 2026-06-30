@@ -139,6 +139,8 @@ class DetectionPublisher:
         if not self.enabled or self._node is None:
             return
         try:
+            # Let ROS2 flush any pending publications
+            time.sleep(0.5)
             self._node.destroy_node()
         except Exception:
             pass

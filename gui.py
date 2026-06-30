@@ -29,8 +29,6 @@ import time
 import json
 import base64
 import threading
-from datetime import datetime
-from std_msgs.msg import Int32, Bool
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QFrame, QProgressBar, QPushButton, QScrollArea,
@@ -151,7 +149,10 @@ class DroneData:
     def snapshot(self):
         with self._lock:
             import copy
-            return copy.copy(self)
+            snap = copy.copy(self)
+            snap.fd_results = list(self.fd_results)
+            snap.log_entries = list(self.log_entries)
+            return snap
 
     def add_log(self, msg, level="info"):
         with self._lock:
@@ -182,7 +183,7 @@ class Ros2Worker(QThread):
             from rclpy.node import Node
             from nav_msgs.msg import Odometry
             from mavros_msgs.msg import State
-            from std_msgs.msg import Float32, String
+            from std_msgs.msg import Float32, String, Int32, Bool
             from sensor_msgs.msg import CompressedImage
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
@@ -440,6 +441,7 @@ class MapPanel(QWidget):
         self.yaw = 0.0
         self.armed = False
         self.trail = []
+        self.features = []
 
     def set_pose(self, x, y, yaw, armed):
         self.x, self.y, self.yaw, self.armed = x, y, yaw, armed
@@ -541,6 +543,25 @@ class MapPanel(QWidget):
             pts = [self._to_px(tx, ty, ox, oy, scale) for tx, ty in self.trail]
             for i in range(len(pts) - 1):
                 p.drawLine(QPointF(*pts[i]), QPointF(*pts[i+1]))
+
+        # Draw detected features on the map
+        for f in self.features:
+            fx_val = f.get("x")
+            fy_val = f.get("y")
+            ref_name = f.get("ref", "—")
+            if fx_val is not None and fy_val is not None:
+                try:
+                    fpx, fpy = self._to_px(float(fx_val), float(fy_val), ox, oy, scale)
+                    # Orange dot for detected features
+                    p.setPen(QPen(C_ORANGE, 2))
+                    p.setBrush(QBrush(C_ORANGE))
+                    p.drawEllipse(QPointF(fpx, fpy), 5, 5)
+                    # Label text
+                    p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+                    p.setPen(QPen(C_TEXT))
+                    p.drawText(QPointF(fpx + 8, fpy + 4), ref_name)
+                except (ValueError, TypeError):
+                    pass
 
         dpx, dpy = self._to_px(self.x, self.y, ox, oy, scale)
         in_arena = (0 <= self.x <= self.ARENA_W_M and
@@ -867,6 +888,7 @@ class GroundStation(QMainWindow):
         self.setWindowTitle("ASCEND Ground Station — Team Anveshak")
         self.setMinimumSize(1100, 740)
         self.data = DroneData()
+        self._detection_triggered = False
 
         self._apply_global_style()
         self._build_ui()
@@ -1196,6 +1218,39 @@ class GroundStation(QMainWindow):
         self._map.reset_trail()
         self.data.add_log("Origin reset to (0, 0, 0)", "info")
 
+    def _run_detection_script(self):
+        import subprocess
+        import os
+        try:
+            images_dir = "images_dir"
+            if not os.path.exists(images_dir) and os.path.exists("images_dir_recent"):
+                images_dir = "images_dir_recent"
+            
+            cmd = [
+                sys.executable,
+                "detection_prat_zak.py",
+                images_dir,
+                "ref_images",
+                "--calib",
+                "zebronics_HD_new.yaml"
+            ]
+            self.data.add_log(f"Auto-triggering: {' '.join(cmd)}", "info")
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate()
+            if process.returncode == 0:
+                self.data.add_log("Feature detection process completed successfully.", "info")
+            else:
+                self.data.add_log(f"Feature detection process failed (code {process.returncode}).", "error")
+                if stderr:
+                    self.data.add_log(f"Error: {stderr.strip()}", "error")
+        except Exception as e:
+            self.data.add_log(f"Failed to launch feature detection: {e}", "error")
+
     # ── Refresh (50 ms) ───────────────────────────────────────────────
     def _refresh(self):
         d = self.data.snapshot()
@@ -1257,6 +1312,16 @@ class GroundStation(QMainWindow):
 
         # Map
         self._map.set_pose(d.x, d.y, d.yaw, d.armed)
+        self._map.features = d.fd_results
+
+        # Auto-trigger feature detection on image transfer completion
+        if d.transfer_status == 2:
+            if not self._detection_triggered:
+                self._detection_triggered = True
+                self.data.add_log("Auto-trigger: Image transfer complete. Starting feature detection...", "info")
+                threading.Thread(target=self._run_detection_script, daemon=True).start()
+        else:
+            self._detection_triggered = False
 
         # Origin readout
         self._origin_lbl.setText(
