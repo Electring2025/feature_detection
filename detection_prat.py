@@ -17,8 +17,8 @@ MODEL_NAME         = "facebook/dinov2-base"
 # Mapping of reference filenames to descriptive nouns (Feature IDs)
 FEATURE_NAMES = {
     "red rock.jpeg": "red_rock",
-    "silver soil.jpeg": "silver_soil",
-    "red soil.jpeg": "red_soil",
+    "silver_soil.jpeg": "silver_soil",
+    "red_soil.jpeg": "red_soil",
     # Add other reference filenames and their desired nouns here
 }
 
