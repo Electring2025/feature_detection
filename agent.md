@@ -23,62 +23,51 @@ The baseline pipeline operates by downsampling all inputs to 128×128 pixels:
 - **Matching**: Computes cosine similarity between all reference patches and all query patches ([compare_and_localize](file:///home/prath/Downloads/feature_detection/detection.py#L134-L198)).
 - **Localization**: Uses thresholding and connected components on the $10 \times 10$ similarity grid to identify the target region and upscales the coordinate back to the original image size.
 
-> [!WARNING]
-> **Limitations**: Since HD query images (e.g., 1080p webcams) are severely downsampled to $128 \times 128$, fine details are lost, and aspect ratios are distorted. A single $14 \times 14$ DINOv2 patch represents a huge region of the original HD frame, making precise localization impossible.
-
 ---
 
 ### 2. Improved Pipeline (`detection_prat.py`)
-To match a small, possibly lower-resolution reference patch (e.g., $128 \times 128$ from a phone) inside a high-resolution query image without loss of detail, `detection_prat.py` implements **Dense Deep Feature Template Matching**:
+To match a small, possibly lower-resolution reference patch (e.g., $128 \times 128$ from a phone) inside a high-resolution query image without loss of detail, `detection_prat.py` implements **Dense Deep Feature Template Matching with Unsupervised Attention Gating**:
 
 ```mermaid
 graph TD
     Ref[Reference 128x128] -->|Pad & Embed| DINO_Ref[DINOv2 Encoder]
+    DINO_Ref -->|Saliency Map| Attention[CLS Self-Attention weights: 10x10]
     DINO_Ref -->|ROI Extraction| Template[Template Features: 10x10x768]
     
     Query[HD Query 1080p] -->|Resize keeping Aspect Ratio| QueryScale[Multi-Scale Query: e.g. H=448]
     QueryScale -->|Embed| DINO_Query[DINOv2 Encoder]
     DINO_Query -->|Feature Map| FeatMap[Query Feature Map: H_q x W_q x 768]
     
-    Template -->|Normalized Cross-Correlation| CrossCorr[2D Cosine Similarity Conv2D]
-    FeatMap -->|Normalized Cross-Correlation| CrossCorr
+    Template -->|Attention-Weighted Convolution| CrossCorr[Weighted Cosine Similarity conv2d]
+    Attention -->|Attention-Weighted Convolution| CrossCorr
+    FeatMap -->|Attention-Weighted Convolution| CrossCorr
     
     CrossCorr --> Heatmap[Dense Heatmap]
-    Heatmap -->|Argmax Peak Score| Output[Best Match BBox & Score]
-    Output -->|HSV Check| ColorGate{Color Gate}
-    ColorGate -->|Pass| Success[Save Coordinates & Log Output]
-    ColorGate -->|Fail| Fail[Discard Match]
+    Heatmap -->|Argmax Peak Score| Success[Save Coordinates & Log Output]
 ```
 
-- **Reference Embedding**: The reference is forced to $128 \times 128$, padded to $224 \times 224$ (via [_pad_to_224](file:///home/prath/Downloads/feature_detection/detection_prat.py#L36-L45)), and encoded. Its central $10 \times 10$ region is extracted to form a spatial template filter of shape `[10, 10, 768]`.
-- **Query Processing**: The query image is processed at multiple heights (`[336, 448, 560]`) while **preserving its aspect ratio** ([compare_and_localize](file:///home/prath/Downloads/feature_detection/detection_prat.py#L199-L264)). The width is dynamically rounded to the nearest multiple of 14 (DINOv2 patch size).
-- **Dense Cross-Correlation**: We treat the reference template as a 2D convolutional filter and apply it over the query feature map using `torch.nn.functional.conv2d` ([compute_dense_similarity](file:///home/prath/Downloads/feature_detection/detection_prat.py#L83-L108)). This produces a dense spatial similarity heatmap.
-- **HSV Color Gating**: Once a candidate match is located, the cropped region is resized to $128 \times 128$ and compared with the reference template's Hue and Saturation mean/std-dev bounds to prevent false positive matches ([check_color_gate](file:///home/prath/Downloads/feature_detection/detection_prat.py#L179-L194)).
+- **Attention Extraction**: The reference is forced to $128 \times 128$, padded to $224 \times 224$ (via [_pad_to_224](file:///home/prath/Downloads/feature_detection/detection_prat.py#L32-L41)), and encoded using `attn_implementation="eager"`. The last-layer self-attentions from the `CLS` token to the patch tokens are extracted ([get_template_embedding](file:///home/prath/Downloads/feature_detection/detection_prat.py#L43-L70)) to produce an unsupervised $10 \times 10$ saliency mask.
+- **Weighted Cross-Correlation**: We multiply each template patch by its squared self-attention score ($W^2$) and run a weighted 2D convolution over the query feature map ([compute_dense_similarity](file:///home/prath/Downloads/feature_detection/detection_prat.py#L78-L98)). This automatically forces DINOv2 to focus only on the stones, ignoring background tiles (regardless of whether they are grey or brown).
+- **Scale-Space Search**: The query image is processed at multiple heights (`[336, 448, 560]`) while **preserving its aspect ratio** ([compare_and_localize](file:///home/prath/Downloads/feature_detection/detection_prat.py#L172-L238)). Bounding boxes are scaled back to the original HD coordinates.
 
 ---
 
 ## 🚀 Execution & Usage
 
 ### Running the Improved Pipeline
-To run the main detection script, specify the query images folder and reference images folder:
+To run the main detection script:
 ```bash
 python detection_prat.py images_dir ref_images/
 ```
 
 ### Hyperparameters
 You can adjust the following parameters inside the script:
-- `MATCH_THRESHOLD` (default: `0.70`): The minimum cosine similarity score required to declare a match.
-- `H_GATE_SIGMA` & `S_GATE_SIGMA` (default: `2.0`): The multiplier of standard deviations allowed for Hue and Saturation validation.
-- `SHOW_DEBUG` (default: `True`): Toggles whether to open an OpenCV window displaying the bounding box and centroid of detected matches.
+- `MATCH_THRESHOLD` (default: `0.32`): The minimum attention-weighted cosine similarity score required to declare a match.
+- `SHOW_DEBUG` (default: `False`): Set to `False` for headless execution compatibility.
 
 ### Output
 1. **Terminal logs**: Only the filename and confidence percentage are output to standard output:
    ```text
-   image_45.jpg 78.43%
+   image_45.jpg 52.51%
    ```
-2. **Coordinate File**: The 3D coordinates from the matched frames' YAML files are saved in `matched_coordinates.yml`:
-   ```yaml
-   - x: 0.0063567087054252625
-     y: -0.0405464842915535
-     z: 1.8247483968734741
-   ```
+2. **Coordinate File**: The 3D coordinates from the matched frames' YAML files are saved in `matched_coordinates.yml`.

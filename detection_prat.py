@@ -11,15 +11,11 @@ from transformers import AutoImageProcessor, AutoModel
 # =============================================================================
 #  HYPERPARAMETERS — edit everything here
 # =============================================================================
-MATCH_THRESHOLD    = 0.70       # Cosine-similarity threshold for patch matching
+MATCH_THRESHOLD    = 0.32       # Cosine-similarity threshold for patch matching
 MODEL_NAME         = "facebook/dinov2-base"
 
-# Color-gating tolerance (multiples of std-dev; set very high to disable)
-H_GATE_SIGMA       = 2.0
-S_GATE_SIGMA       = 2.0
-
 # Visualization toggle
-SHOW_DEBUG         = True
+SHOW_DEBUG         = True        # Set to True to visualize matches (press any key to continue)
 # =============================================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -28,7 +24,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Model
 # ---------------------------------------------------------------------------
 processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-model     = AutoModel.from_pretrained(MODEL_NAME).to(device).eval()
+model     = AutoModel.from_pretrained(MODEL_NAME, attn_implementation="eager").to(device).eval()
 
 # ---------------------------------------------------------------------------
 # Embedding helpers
@@ -46,24 +42,32 @@ def _pad_to_224(img_rgb_128: np.ndarray) -> np.ndarray:
 
 def get_template_embedding(img_rgb_128: np.ndarray):
     """
-    Compute template normalized embeddings for a 128×128 RGB reference image.
+    Compute template normalized embeddings and CLS attention weights for a 128×128 RGB reference image.
     Returns:
       normalized_patches: Tensor of shape [10, 10, 768] (unit normalized along channel dimension)
-      mean_emb: Tensor of shape [1, 1, 768]
+      roi_attn: Tensor of shape [10, 10]
     """
     canvas = _pad_to_224(img_rgb_128)
     inputs = processor(images=canvas, return_tensors="pt").to(device)
+    model.config.output_attentions = True
     with torch.no_grad():
         outputs = model(**inputs)
+    model.config.output_attentions = False
     patch_tokens = outputs.last_hidden_state[:, 1:, :]          # drop CLS [1, 256, 768]
     patch_grid   = patch_tokens.view(16, 16, 768)
     roi_patches  = patch_grid[3:13, 3:13, :]                     # 10×10 ROI [10, 10, 768]
     
     normalized_patches = torch.nn.functional.normalize(roi_patches, p=2, dim=-1)
-    mean_emb = normalized_patches.mean(dim=(0, 1), keepdim=True)
-    mean_emb = torch.nn.functional.normalize(mean_emb, p=2, dim=-1)
     
-    return normalized_patches, mean_emb
+    # Extract CLS attention map from last layer
+    last_layer_att = outputs.attentions[-1]
+    cls_to_patches = last_layer_att[0, :, 0, 1:]
+    mean_attention = cls_to_patches.mean(dim=0)
+    attn_grid = mean_attention.view(16, 16)
+    roi_attn = attn_grid[3:13, 3:13]
+    roi_attn = (roi_attn - roi_attn.min()) / (roi_attn.max() - roi_attn.min() + 1e-8)
+    
+    return normalized_patches, roi_attn
 
 def preprocess_image_tensor(img_bgr: np.ndarray, target_w: int, target_h: int, device):
     """
@@ -80,30 +84,25 @@ def preprocess_image_tensor(img_bgr: np.ndarray, target_w: int, target_h: int, d
     tensor = (tensor - mean) / std
     return tensor.unsqueeze(0).to(device)
 
-def compute_dense_similarity(query_features, template_features):
+def compute_dense_similarity(query_features, template_features, weights):
     """
-    Perform dense cosine similarity matching in the deep feature space.
+    Perform attention-weighted dense cosine similarity matching in the deep feature space.
     query_features: [1, 768, H_q, W_q]
     template_features: [10, 10, 768]
+    weights: [10, 10]
     """
     device_loc = query_features.device
     kh, kw, C = template_features.shape
     
-    # Normalize template over all dimensions to compute cosine similarity correctly
     T = template_features.permute(2, 0, 1).unsqueeze(0) # [1, 768, 10, 10]
-    T_norm = T / (T.pow(2).sum().sqrt() + 1e-8)
+    W2 = (weights ** 2).unsqueeze(0).unsqueeze(0) # [1, 1, 10, 10]
     
-    # Calculate local window norms on query features (since query features are unit-normalized
-    # along the channel dimension, the sum of squares in a 10x10 window is simply 10*10 = 100)
-    F_sq = query_features.pow(2).sum(dim=1, keepdim=True)
-    sum_filter = torch.ones((1, 1, kh, kw), device=device_loc)
-    F_local_norm = torch.nn.functional.conv2d(F_sq, sum_filter, padding=0).sqrt()
+    T_weighted = T * W2
     
-    # Dense correlation
-    correlation = torch.nn.functional.conv2d(query_features, T_norm, padding=0)
+    numerator = torch.nn.functional.conv2d(query_features, T_weighted, padding=0)
+    denominator = W2.sum()
     
-    # Cosine similarity
-    similarity = correlation / (F_local_norm + 1e-8)
+    similarity = numerator / (denominator + 1e-8)
     return similarity.squeeze()
 
 # ---------------------------------------------------------------------------
@@ -159,39 +158,14 @@ def load_reference_images(ref_dir: str) -> list:
             img_128_bgr = img_bgr
             
         img_128_rgb = cv2.cvtColor(img_128_bgr, cv2.COLOR_BGR2RGB)
-
-        img_hsv = cv2.cvtColor(img_128_bgr, cv2.COLOR_BGR2HSV)
-        h, s, _ = cv2.split(img_hsv)
         
-        normalized_patches, mean_emb = get_template_embedding(img_128_rgb)
+        normalized_patches, roi_attn = get_template_embedding(img_128_rgb)
         refs.append({
             "name": name,
             "emb": normalized_patches,
-            "emb_mean": mean_emb,
-            "h_stats": (float(np.mean(h)), float(np.std(h))),
-            "s_stats": (float(np.mean(s)), float(np.std(s))),
+            "attn": roi_attn,
         })
     return refs
-
-# ---------------------------------------------------------------------------
-# Color Gating
-# ---------------------------------------------------------------------------
-def check_color_gate(matched_crop_bgr, ref) -> bool:
-    if matched_crop_bgr.size == 0:
-        return False
-    crop_128 = cv2.resize(matched_crop_bgr, (128, 128), interpolation=cv2.INTER_AREA)
-    crop_hsv = cv2.cvtColor(crop_128, cv2.COLOR_BGR2HSV)
-    h_f, s_f, _ = cv2.split(crop_hsv)
-    
-    h_mean, h_std = ref["h_stats"]
-    s_mean, s_std = ref["s_stats"]
-    
-    h_diff = abs(np.mean(h_f) - h_mean)
-    s_diff = abs(np.mean(s_f) - s_mean)
-    
-    if h_diff > H_GATE_SIGMA * h_std or s_diff > S_GATE_SIGMA * s_std:
-        return False
-    return True
 
 # ---------------------------------------------------------------------------
 # Comparison & Localization
@@ -218,7 +192,7 @@ def compare_and_localize(img_bgr: np.ndarray, ref: dict, threshold: float) -> di
         patch_grid = patch_tokens.view(1, H_patches, W_patches, 768).permute(0, 3, 1, 2)
         query_features = torch.nn.functional.normalize(patch_grid, p=2, dim=1)
         
-        sim_map = compute_dense_similarity(query_features, ref["emb"])
+        sim_map = compute_dense_similarity(query_features, ref["emb"], ref["attn"])
         
         max_val, max_idx = torch.max(sim_map.view(-1), dim=0)
         max_val = max_val.item()
@@ -251,10 +225,6 @@ def compare_and_localize(img_bgr: np.ndarray, ref: dict, threshold: float) -> di
         
     x1, y1, x2, y2 = best_bbox
     if x2 <= x1 or y2 <= y1:
-        return None
-        
-    matched_crop = img_bgr[y1:y2, x1:x2]
-    if not check_color_gate(matched_crop, ref):
         return None
         
     return {
