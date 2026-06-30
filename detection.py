@@ -10,7 +10,7 @@ from transformers import AutoImageProcessor, AutoModel
 # =============================================================================
 #  HYPERPARAMETERS — edit everything here
 # =============================================================================
-MATCH_THRESHOLD    = 0.70       # Cosine-similarity threshold for patch matching
+MATCH_THRESHOLD    = 0.95       # Cosine-similarity threshold for patch matching
 MODEL_NAME         = "facebook/dinov2-base"
 
 # Color-gating tolerance (multiples of std-dev; set very high to disable)

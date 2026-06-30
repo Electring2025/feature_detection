@@ -19,7 +19,7 @@ H_GATE_SIGMA       = 2.0
 S_GATE_SIGMA       = 2.0
 
 # Visualization toggle
-SHOW_DEBUG         = False
+SHOW_DEBUG         = True
 # =============================================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
