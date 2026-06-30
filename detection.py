@@ -216,7 +216,7 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
     refs = load_reference_images(ref_images_dir)
     if not refs:
         print("[ERROR] No reference images found. Exiting.")
-        return
+        return []
     print(f"  {len(refs)} reference(s) loaded.\n")
 
     query_images = []
@@ -244,6 +244,7 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
 
     print(f"Query images found: {len(query_images)}\n")
 
+    matched_coords = []
     a = time.time()
     for count, (img_idx, img_path, yaml_path) in enumerate(query_images, 1):
         img_bgr = cv2.imread(img_path)
@@ -252,6 +253,7 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
         coords = load_yaml_coordinates(yaml_path)
         coord_str = f"x={coords['x']}, y={coords['y']}, z={coords['z']}" if coords else "No YAML"
 
+        matched_for_query = False
         for ref in refs:
             match_data = compare_and_localize(img_bgr, ref, threshold)
             
@@ -262,9 +264,13 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
                 
                 print(
                     f"[MATCH] query: image{img_idx}.jpeg | ref: {ref['name']} | "
-                    f"score: {score * 100:.2f}% | pos: {coord_str} | "
+                    f"score: {score * 100:.2f}% | pic_num: {img_idx} | "
                     f"Feature Centroid: ({cx}, {cy})"
                 )
+
+                if coords and not matched_for_query:
+                    matched_coords.append(coords)
+                    matched_for_query = True
 
                 if SHOW_DEBUG:
                     debug_frame = img_bgr.copy()
@@ -291,6 +297,7 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
     print(f"\nDone. Time taken: {b - a:.2f}s")
     if SHOW_DEBUG:
         cv2.destroyAllWindows()
+    return matched_coords
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -304,9 +311,19 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    process_images(
+    coords_list = process_images(
         images_dir     = args.images_dir,
         ref_images_dir = args.ref_images_dir,
         threshold      = args.threshold,
         # calib_yaml     = args.calib
     )
+
+    # Output matched coordinates in YAML list format
+    print("\nMatched coordinates (YAML list format):")
+    yaml_str = yaml.safe_dump(coords_list, default_flow_style=False)
+    print(yaml_str)
+
+    # Save to file
+    with open("matched_coordinates.yml", "w") as f:
+        f.write(yaml_str)
+    print("\n[INFO] Saved coordinates to matched_coordinates.yml")
