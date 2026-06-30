@@ -23,7 +23,7 @@ FEATURE_NAMES = {
 }
 
 # Visualization toggle
-SHOW_DEBUG         = False        # Set to True to visualize matches
+SHOW_DEBUG         = True        # Set to True to visualize matches
 # =============================================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -300,12 +300,39 @@ def process_images(images_dir: str, ref_images_dir: str, threshold: float, calib
             img_idx = get_file_num(name)
             query_images.append((img_idx, img_path, yaml_path))
 
+    # Group images by stop and select the top 4 sharpest (least blurred) frames using Laplacian Variance
+    stops = {}
+    for (img_idx, img_path, yaml_path) in query_images:
+        group_id = (img_idx // 10) * 10
+        if group_id not in stops:
+            stops[group_id] = []
+        stops[group_id].append((img_idx, img_path, yaml_path))
+
+    selected_query_images = []
+    for group_id, group_list in sorted(stops.items()):
+        scored_images = []
+        for (img_idx, img_path, yaml_path) in group_list:
+            img = cv2.imread(img_path)
+            if img is not None:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+                scored_images.append((blur_score, (img_idx, img_path, yaml_path)))
+        
+        # Sort by blur score descending (highest variance = sharpest first)
+        scored_images.sort(key=lambda x: x[0], reverse=True)
+        # Select top 4
+        top_4 = [item[1] for item in scored_images[:4]]
+        
+        selected_names = [os.path.basename(x[1]) for x in top_4]
+        print(f"[INFO] Group {group_id}: Selected 4 sharpest frames: {selected_names}", flush=True)
+        selected_query_images.extend(top_4)
+
     # Group raw detections by stop group_id (10 images per stop)
     group_detections = {}
 
-    for count, (img_idx, img_path, yaml_path) in enumerate(query_images, 1):
-        if count % 10 == 0 or count == len(query_images):
-            print(f"-> Active progress: processed {count}/{len(query_images)} frames...", flush=True)
+    for count, (img_idx, img_path, yaml_path) in enumerate(selected_query_images, 1):
+        if count % 4 == 0 or count == len(selected_query_images):
+            print(f"-> Active progress: processed {count}/{len(selected_query_images)} frames...", flush=True)
 
         img_bgr = cv2.imread(img_path)
         if img_bgr is None: continue
